@@ -6,28 +6,28 @@ import (
 	"fmt"
 	"log"
 	"runtime/debug"
+	"sync"
 	"time"
+
+	"github.com/Workiva/go-datastructures/queue"
 )
 
 type EventCallback func(*Event) (interface{}, error)
 
 type EventManager struct {
-	dispatcher  map[string]func(*Event)
-	eventChan   chan *Event
-	execChan    chan func()
-	timerChan   chan struct{}
-	nextTimerId uint64
-	timerHeap   timerHeap
-	timer       *time.Timer
+	dispatcher     map[string]func(*Event)
+	workRingBuffer *queue.RingBuffer
+	workMutex      sync.Mutex
+	nextTimerId    uint64
+	timerHeap      timerHeap
+	timer          *time.Timer
 }
 
 func NewEventManager() *EventManager {
 	mgr := &EventManager{
-		eventChan:   make(chan *Event, 1024),
-		dispatcher:  make(map[string]func(*Event)),
-		timerChan:   make(chan struct{}, 1024),
-		execChan:    make(chan func(), 1024),
-		nextTimerId: 1,
+		workRingBuffer: queue.NewRingBuffer(1024),
+		dispatcher:     make(map[string]func(*Event)),
+		nextTimerId:    1,
 	}
 	heap.Init(&mgr.timerHeap)
 	return mgr
@@ -36,27 +36,37 @@ func NewEventManager() *EventManager {
 func (mgr *EventManager) Serve(ctx context.Context) error {
 	for {
 		workCtx, workCancel := context.WithCancel(context.Background())
-		go mgr.woker(ctx, workCancel)
+		go mgr.woker(workCancel)
 
 		select {
 		case <-workCtx.Done():
 			continue
 		case <-ctx.Done():
+			ev := newExitEvent()
+			mgr.pushEvent(ev)
 			return ctx.Err()
 		}
 	}
 }
 
-func (mgr *EventManager) woker(ctx context.Context, cancel context.CancelFunc) {
+func (mgr *EventManager) woker(cancel context.CancelFunc) {
 	for {
-		select {
-		case ev := <-mgr.eventChan:
-			mgr.handleEvent(ev, cancel)
-		case cb := <-mgr.execChan:
-			mgr.handleExec(cb, cancel)
-		case <-mgr.timerChan:
+		e, err := mgr.workRingBuffer.Get()
+		if err != nil {
+			cancel()
+			log.Println("aevent work error", err)
+			return
+		}
+
+		event := e.(*Event)
+		switch event.eventType {
+		case EventTypeEvent:
+			mgr.handleEvent(event, cancel)
+		case EventTypeTimer:
 			mgr.handleTimer(cancel)
-		case <-ctx.Done():
+		case EventTypeExec:
+			mgr.handleExec(event.exec, cancel)
+		case EventTypeExit:
 			return
 		}
 	}
@@ -67,25 +77,13 @@ func (mgr *EventManager) handleEvent(ev *Event, cancel context.CancelFunc) {
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("async event event:%s recover panic %v\n", ev.Name(), r)
-				if ev.errChan != nil {
-					ev.errChan <- fmt.Errorf("%v", r)
-				}
+				ev.Response(nil, fmt.Errorf("%v", r))
 				debug.PrintStack()
 				cancel()
 			}
 		}()
 
 		cb(ev)
-		/*
-			rsp, err := cb(ev)
-			if ev.rspChan != nil && ev.errChan != nil {
-				if err != nil {
-					ev.errChan <- err
-				} else {
-					ev.rspChan <- rsp
-				}
-			}
-		*/
 	} else {
 		log.Printf("async event event:%s callback not exists", ev.Name())
 	}
@@ -163,12 +161,8 @@ func (mgr *EventManager) onTimer(cb TimerCallback, now time.Time, cancel context
 func (mgr *EventManager) RegisterEvent(name string, cb EventCallback) {
 	mgr.dispatcher[name] = func(ev *Event) {
 		rsp, err := cb(ev)
-		if ev.rspChan != nil && ev.errChan != nil {
-			if err != nil {
-				ev.errChan <- err
-			} else {
-				ev.rspChan <- rsp
-			}
+		if ev.response != nil {
+			ev.Response(rsp, err)
 		}
 	}
 }
@@ -177,28 +171,51 @@ func (mgr *EventManager) RegisterEventRaw(name string, cb func(*Event)) {
 	mgr.dispatcher[name] = cb
 }
 
+func (mgr *EventManager) pushEvent(e *Event) {
+	mgr.workMutex.Lock()
+	defer mgr.workMutex.Unlock()
+	mgr.workRingBuffer.Put(e)
+
+}
+
 func (mgr *EventManager) CallEvent(ctx context.Context, name string, msg interface{}) (rsp interface{}, err error) {
 	ev := newEvent(name, msg, true)
-	mgr.eventChan <- ev
+	mgr.pushEvent(ev)
 
-	select {
-	case rsp = <-ev.rspChan:
-		return
-	case err = <-ev.errChan:
-		return
-	case <-ctx.Done():
-		err = ctx.Err()
-		return
+	for {
+		select {
+		case <-ctx.Done():
+			err = ctx.Err()
+			return
+		default:
+		}
+
+		rspVal, rspErr := ev.response.Poll(time.Second)
+		if rspErr == queue.ErrTimeout {
+			continue
+		} else if rspErr != nil {
+			err = rspErr
+			return
+		}
+
+		var ok bool
+		if err, ok = rspVal.(error); ok {
+			return
+		} else {
+			rsp = rspVal
+			return
+		}
 	}
 }
 
 func (mgr *EventManager) SendEvent(name string, msg interface{}) {
 	ev := newEvent(name, msg, false)
-	mgr.eventChan <- ev
+	mgr.pushEvent(ev)
 }
 
 func (mgr *EventManager) Exec(cb func()) {
-	mgr.execChan <- cb
+	ev := newExecEvent(cb)
+	mgr.pushEvent(ev)
 }
 
 func (mgr *EventManager) fireTimer(last *eventTimer, cur *eventTimer) {
@@ -212,8 +229,10 @@ func (mgr *EventManager) fireTimer(last *eventTimer, cur *eventTimer) {
 	if mgr.timer != nil {
 		mgr.timer.Stop()
 	}
-	mgr.timer = time.AfterFunc(cur.fireTime.Sub(time.Now()), func() {
-		mgr.timerChan <- struct{}{}
+	now := time.Now()
+	mgr.timer = time.AfterFunc(cur.fireTime.Sub(now), func() {
+		ev := newTimerEvent()
+		mgr.pushEvent(ev)
 	})
 }
 

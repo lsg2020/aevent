@@ -1,23 +1,55 @@
 package aevent
 
-type Event struct {
-	name string
-	data interface{}
+import (
+	"github.com/Workiva/go-datastructures/queue"
+)
 
-	rspChan chan interface{}
-	errChan chan error
+const (
+	EventTypeEvent = iota
+	EventTypeExec
+	EventTypeTimer
+	EventTypeExit
+)
+
+type Event struct {
+	eventType uint32
+
+	name     string
+	data     interface{}
+	response *queue.RingBuffer
+
+	exec func()
 }
 
 func newEvent(name string, data interface{}, needResponse bool) *Event {
 	ev := &Event{
-		name: name,
-		data: data,
+		eventType: EventTypeEvent,
+		name:      name,
+		data:      data,
 	}
 	if needResponse {
-		ev.rspChan = make(chan interface{}, 1)
-		ev.errChan = make(chan error, 1)
+		ev.response = queue.NewRingBuffer(1)
 	}
 	return ev
+}
+
+func newTimerEvent() *Event {
+	return &Event{
+		eventType: EventTypeTimer,
+	}
+}
+
+func newExecEvent(cb func()) *Event {
+	return &Event{
+		eventType: EventTypeExec,
+		exec:      cb,
+	}
+}
+
+func newExitEvent() *Event {
+	return &Event{
+		eventType: EventTypeExit,
+	}
 }
 
 func (e Event) Name() string {
@@ -28,6 +60,10 @@ func (e *Event) Data() interface{} {
 	return e.data
 }
 
-func (e *Event) Response() (chan interface{}, chan error) {
-	return e.rspChan, e.errChan
+func (e *Event) Response(response interface{}, err error) {
+	if err != nil {
+		e.response.Put(err)
+	} else {
+		e.response.Put(response)
+	}
 }

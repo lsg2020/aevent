@@ -36,12 +36,12 @@ func main() {
 			time.Sleep(ev.sleep)
 			log.Println("process end call sleep ", ev)
 
-			rspChan, _ := event.Response()
-			rspChan <- ev
+			event.Response(ev, nil)
 		}()
 	})
 
 	go func() {
+		// call event
 		{
 			ctx, _ := context.WithTimeout(context.Background(), time.Second*1)
 			rsp, err := event.CallEvent(ctx, EventNameCall, &EventData{
@@ -51,6 +51,7 @@ func main() {
 			log.Println("call result", rsp, err)
 		}
 
+		// call event response in other goroutine
 		{
 			ctx, _ := context.WithTimeout(context.Background(), time.Second*1)
 			rsp, err := event.CallEvent(ctx, EventNameCallSleep, &EventData{
@@ -61,6 +62,7 @@ func main() {
 			log.Println("call sleep result", rsp, err)
 		}
 
+		// call timeout
 		{
 			ctx, _ := context.WithTimeout(context.Background(), time.Second*1)
 			rsp, err := event.CallEvent(ctx, EventNameCallSleep, &EventData{
